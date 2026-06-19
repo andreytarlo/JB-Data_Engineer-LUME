@@ -115,3 +115,18 @@ def _increment_dup_counter(r: redis_lib.Redis, count: int) -> None:
     pipe.incrby(key, count)
     pipe.expire(key, COUNTER_TTL_S)
     pipe.execute()
+
+
+def unmark_payloads(redis_client: redis_lib.Redis | None, payloads: list[dict]) -> None:
+    """Undo the dedup marks claimed for these payloads.
+
+    Called when a downstream write fails and the batch will be retried: without
+    this, the retry would see the delivery_ids as already-processed and silently
+    drop them, losing the readings.  Removing the marks lets the retry reprocess
+    them; Layer 5's conditional upsert keeps the reprocess idempotent.
+    """
+    if redis_client is None or not payloads:
+        return
+    keys = [f"dedup:{p.get('delivery_id', '')}" for p in payloads if p.get("delivery_id")]
+    if keys:
+        redis_client.delete(*keys)

@@ -9,8 +9,23 @@ Rejection types:
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 KWH_MIN: float = 0.0
 KWH_MAX: float = 50.0
+
+
+def _parsable_ts(value) -> bool:
+    """True if value is a usable timestamp (datetime or ISO-8601 string)."""
+    if isinstance(value, datetime):
+        return True
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return True
+        except ValueError:
+            return False
+    return False
 
 
 def validate_readings(
@@ -33,9 +48,9 @@ def validate_readings(
         reject_type:   str | None = None
         reject_detail: str | None = None
 
-        if reading_time is None:
+        if not _parsable_ts(reading_time):
             reject_type   = "invalid_reading_time"
-            reject_detail = "reading_time is null"
+            reject_detail = "reading_time absent or unparseable"
         elif kwh is None:
             reject_type   = "missing_kwh"
             reject_detail = "kwh is null"

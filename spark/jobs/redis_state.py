@@ -5,6 +5,9 @@ Eight active keys:
   window:kwh            Running kWh sum (INCRBYFLOAT, atomic).
   window:meters_hll     HyperLogLog of meter IDs that reported this window.
                         PFADD + PFCOUNT: ~1% error, 12 KB fixed memory.
+  window:meters         Plain mirror of PFCOUNT(window:meters_hll) so Grafana can
+                        read it via GET (the redis-datasource PFCOUNT command
+                        returns no data frame).
   window:last_batch     Timestamp of the last processed batch (TTL 150 s).
                         Dashboard shows "feed dead" when this key expires.
   window:forecast       Projected end-of-window total (recalculated each batch).
@@ -71,6 +74,7 @@ def update_window_state(
     readings: list[dict],
     invalid_count: int = 0,
     backfill_active: bool = False,
+    book_meter_count: int = 0,
 ) -> None:
     """Update Redis window state for one micro-batch of valid readings.
 
@@ -81,6 +85,8 @@ def update_window_state(
         backfill_active:  True when the batch contains backfill payloads.
                           Sets window:backfill_active (TTL 60 s) so Grafana
                           can display a "filling gaps" banner during spikes.
+        book_meter_count: Total meters in the book (homes table). Used for the
+                          coverage-based end-of-window forecast; 0 disables it.
     """
     if redis_client is None:
         log.warning("Redis unavailable — skipping window state update")
@@ -93,7 +99,7 @@ def update_window_state(
     # current timestamps so data_now ≈ now_utc.  In simulation mode (replaying
     # 2013-2014 data) data_now follows the simulated clock instead, so the
     # window keys stay meaningful and Grafana shows real data rather than zeros.
-    reading_times = [_ts(r.get("reading_time")) for r in readings if r.get("reading_time")]
+    reading_times = [t for r in readings if (t := _ts(r.get("reading_time"))) is not None]
     data_now   = max(reading_times) if reading_times else now_utc
     cur_window = _window_start(data_now)
 
@@ -105,7 +111,7 @@ def update_window_state(
             current.append(r)
 
     if current:
-        _apply_to_window(redis_client, current, now_utc, cur_window)
+        _apply_to_window(redis_client, current, now_utc, cur_window, book_meter_count)
 
     # Backfill banner — refresh TTL every batch while backfill is active.
     # Key self-expires 60 s after the last backfill batch, no cleanup needed.
@@ -127,6 +133,7 @@ def _apply_to_window(
     readings: list[dict],
     now_utc: datetime,
     cur_window: datetime,
+    book_meter_count: int = 0,
 ) -> None:
     # Roll over if the stored window start doesn't match the current one.
     stored_raw = r.get("window:start")
@@ -150,17 +157,36 @@ def _apply_to_window(
     pipe.set("window:last_batch", now_utc.isoformat(), ex=LAST_BATCH_TTL_S)
     pipe.execute()
 
-    # Forecast: (kWh so far) ÷ (elapsed minutes) × 30.
-    elapsed_m = max((now_utc - cur_window).total_seconds() / 60.0, 1.0)
-    kwh_now   = float(r.get("window:kwh") or 0)
-    forecast  = round(kwh_now / elapsed_m * WINDOW_MINUTES, 2)
+    # Forecast — coverage-based projection.
+    #
+    # A time-based projection (kWh ÷ elapsed-minutes × 30) cannot work here:
+    # every reading_time is stamped on the :00/:30 settlement boundary, so all
+    # readings in a window share the same timestamp and "elapsed minutes" is
+    # always 0.  Mixing wall-clock now (2026) with the data-time window (2013-14)
+    # made it worse, pinning the forecast at ~0.
+    #
+    # Instead we project from coverage: kWh seen so far scaled up by the share
+    # of the book that has reported.  If 40% of meters have reported, the
+    # end-of-window total is projected at kWh / 0.40.  Once every meter has
+    # reported the forecast equals the actual running total.
+    kwh_now     = float(r.get("window:kwh") or 0)
+    meters_seen = int(r.pfcount("window:meters_hll") or 0)
+    # Mirror the HyperLogLog count into a plain string key.  The redis-datasource
+    # Grafana plugin returns no data frame for the PFCOUNT command, but it does
+    # for GET — so the "Active Meters" panel reads window:meters, not the HLL.
+    r.set("window:meters", meters_seen)
+    if book_meter_count > 0 and meters_seen > 0:
+        coverage = min(meters_seen / book_meter_count, 1.0)
+        forecast = round(kwh_now / coverage, 2)
+    else:
+        forecast = kwh_now
     r.set("window:forecast", forecast)
 
 
 def _rollover(r, new_start: datetime) -> None:
     log.info("Window rollover → %s", new_start.isoformat())
     pipe = r.pipeline()
-    for key in ("window:kwh", "window:meters_hll", "window:last_batch", "window:forecast"):
+    for key in ("window:kwh", "window:meters_hll", "window:meters", "window:last_batch", "window:forecast"):
         pipe.delete(key)
     pipe.set("window:start", new_start.isoformat())
     pipe.set("window:kwh", 0)

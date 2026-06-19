@@ -53,24 +53,32 @@ def _connect() -> psycopg.Connection:
 
 # ─── Task 1: Meter silence check (every 30 min) ───────────────────────────────
 
+# "Now" is the latest reading_time we hold, NOT wall-clock NOW().  The replay
+# streams 2013-2014 data while the wall clock is years later, so NOW() would put
+# every meter past the silence threshold (or, via the 30-day pre-filter, exclude
+# them all and return nothing).  Anchoring on MAX(reading_time) measures silence
+# in data-time, which is what the operator actually cares about.
 _SILENCE_QUERY = """
-WITH last_reading AS (
+WITH data_now AS (
+    SELECT MAX(reading_time) AS now_ts FROM clean_readings
+),
+last_reading AS (
     SELECT
         cr.meter_id,
         h.postcode_area,
         MAX(cr.reading_time) AS last_seen
     FROM  clean_readings cr
     LEFT  JOIN homes h USING (meter_id)
-    WHERE cr.reading_time > NOW() - INTERVAL '30 days'
+    WHERE cr.reading_time > (SELECT now_ts FROM data_now) - INTERVAL '30 days'
     GROUP BY cr.meter_id, h.postcode_area
 )
 SELECT
     meter_id,
     postcode_area,
     last_seen,
-    EXTRACT(EPOCH FROM (NOW() - last_seen)) / 3600.0 AS silent_hours
+    EXTRACT(EPOCH FROM ((SELECT now_ts FROM data_now) - last_seen)) / 3600.0 AS silent_hours
 FROM last_reading
-WHERE last_seen < NOW() - INTERVAL '%s hours'
+WHERE last_seen < (SELECT now_ts FROM data_now) - INTERVAL '%s hours'
 ORDER BY silent_hours DESC
 """
 
@@ -169,12 +177,17 @@ def refresh_orphan_summary(conn: psycopg.Connection) -> None:
 
 # ─── Task 3: Archive + purge rejected_readings (daily 04:00) ─────────────────
 
+# Bucket by reading_time (data-time), falling back to rejected_at only when the
+# reading had no parseable timestamp.  rejected_at is wall-clock (2026) and would
+# make the permanent trend table disagree with every reading_time-based query and
+# dashboard.  The retention filter below still uses rejected_at — that is real
+# insert age, which is the right basis for purging.
 _ARCHIVE_REJECTED = """
 INSERT INTO rejection_hourly_summary (ts_hour, rejection_reason, count)
 SELECT
-    date_trunc('hour', rejected_at) AS ts_hour,
-    rejection_type                  AS rejection_reason,
-    COUNT(*)                        AS count
+    date_trunc('hour', COALESCE(reading_time, rejected_at)) AS ts_hour,
+    rejection_type                                          AS rejection_reason,
+    COUNT(*)                                                AS count
 FROM  rejected_readings
 WHERE rejected_at < NOW() - INTERVAL '1 day'
 GROUP BY 1, 2
@@ -213,6 +226,12 @@ def archive_and_purge_rejected(conn: psycopg.Connection) -> None:
 def main() -> None:
     conn = _connect()
 
+    # Run the dashboard-feeding jobs once at startup so their panels are populated
+    # immediately instead of staying empty until the first scheduled tick (up to
+    # 30 min for the silence check).
+    check_meter_silence(conn)
+    refresh_orphan_summary(conn)
+
     scheduler = BlockingScheduler(timezone="UTC")
 
     scheduler.add_job(
@@ -221,6 +240,10 @@ def main() -> None:
         id="meter_silence",
         name="Meter silence check",
         max_instances=1,
+        # A heavy query can push the fire time past the default 1 s grace window,
+        # which silently SKIPS the run.  Allow lateness and coalesce missed runs.
+        misfire_grace_time=600,
+        coalesce=True,
     )
 
     scheduler.add_job(
@@ -229,6 +252,8 @@ def main() -> None:
         id="orphan_summary",
         name="Orphan meter summary",
         max_instances=1,
+        misfire_grace_time=600,
+        coalesce=True,
     )
 
     scheduler.add_job(
@@ -237,6 +262,8 @@ def main() -> None:
         id="archive_rejected",
         name="Archive + purge rejected readings",
         max_instances=1,
+        misfire_grace_time=600,
+        coalesce=True,
     )
 
     log.info(

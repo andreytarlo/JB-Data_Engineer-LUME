@@ -210,6 +210,7 @@ services:
     command: >
       /opt/bitnami/spark/bin/spark-submit
       --master local[2]
+      --driver-memory 2g
       /app/jobs/process.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092

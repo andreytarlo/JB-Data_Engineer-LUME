@@ -31,7 +31,7 @@ import psycopg
 import redis as redis_lib
 from pyspark.sql import SparkSession, DataFrame
 
-from dedup        import process_batch_dedup
+from dedup        import process_batch_dedup, unmark_payloads
 from validate     import validate_readings
 from db_writer    import (
     upsert_clean_readings,
@@ -64,6 +64,11 @@ def _connect_pg() -> psycopg.Connection:
     for attempt in range(15):
         try:
             conn = psycopg.connect(PG_DSN, autocommit=False)
+            # Bigger work_mem keeps the upsert's DISTINCT ON sort in memory
+            # instead of spilling to disk on large catch-up batches.
+            with conn.cursor() as cur:
+                cur.execute("SET work_mem = '256MB'")
+            conn.commit()
             log.info("PostgreSQL connected")
             return conn
         except Exception as exc:
@@ -83,9 +88,28 @@ def _connect_redis() -> redis_lib.Redis | None:
         return None
 
 
+def _book_meter_count(conn: psycopg.Connection) -> int:
+    """Total meters in the book (homes table) — denominator for the
+    coverage-based end-of-window forecast.  Read once at startup; homes is
+    loaded by load-dimensions before Spark starts (compose depends_on)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM homes")
+            count = int(cur.fetchone()[0])
+        log.info("Book size: %d meters (forecast denominator)", count)
+        return count
+    except Exception as exc:
+        log.warning("Could not read homes count (%s) — forecast falls back to running total", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
 # ─── Batch handler ────────────────────────────────────────────────────────────
 
-def _make_handler(pg_conn: psycopg.Connection, redis_client):
+def _make_handler(pg_conn: psycopg.Connection, redis_client, book_meter_count: int = 0):
     """Return a foreachBatch callback closed over the shared connections."""
 
     def handle_batch(batch_df: DataFrame, epoch_id: int) -> None:
@@ -139,14 +163,23 @@ def _make_handler(pg_conn: psycopg.Connection, redis_client):
         log.info("epoch=%d  valid=%d  rejected=%d", epoch_id, len(all_valid), len(all_rejected))
 
         # ── Step 5: Upsert clean readings ─────────────────────────────────────
+        # This is the one write we must not lose.  On failure we roll back the
+        # Redis dedup marks claimed in step 2 and re-raise: Spark then fails the
+        # batch WITHOUT committing the Kafka offset, so on restart the same
+        # readings are reprocessed (Layer 5's conditional upsert makes the
+        # reprocess idempotent).  Re-raising before step 6 also prevents the
+        # append-only rejected/duplicate writes from running twice on retry.
         try:
             upsert_clean_readings(pg_conn, all_valid)
         except Exception as exc:
-            log.error("epoch=%d  upsert_clean_readings failed: %s", epoch_id, exc)
+            log.error("epoch=%d  upsert_clean_readings failed — failing batch "
+                      "for retry: %s", epoch_id, exc)
             try:
                 pg_conn.rollback()
             except Exception:
                 pass
+            unmark_payloads(redis_client, new_payloads)
+            raise
 
         # ── Step 6: Write rejected readings ──────────────────────────────────
         try:
@@ -175,6 +208,7 @@ def _make_handler(pg_conn: psycopg.Connection, redis_client):
                 all_valid,
                 invalid_count=len(all_rejected),
                 backfill_active=has_backfill,
+                book_meter_count=book_meter_count,
             )
         except Exception as exc:
             log.warning("epoch=%d  redis_state failed: %s", epoch_id, exc)
@@ -187,6 +221,7 @@ def _make_handler(pg_conn: psycopg.Connection, redis_client):
 def main() -> None:
     pg_conn      = _connect_pg()
     redis_client = _connect_redis()
+    book_meters  = _book_meter_count(pg_conn)
 
     spark = (
         SparkSession.builder
@@ -202,7 +237,13 @@ def main() -> None:
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", "earliest")
-        .option("maxOffsetsPerTrigger", 10_000)
+        # Cap = Kafka MESSAGES per trigger, not readings.  A live delivery is a
+        # handful of readings, but a backfill page carries up to 1000, so a large
+        # cap could mean millions of readings collected into the driver at once →
+        # OutOfMemoryError, and a multi-minute batch that freezes the dashboard.
+        # 500 keeps each trigger small enough that the COPY upsert finishes in a
+        # few seconds, so the live panels refresh smoothly.
+        .option("maxOffsetsPerTrigger", 500)
         .option("kafka.group.id", "lume-processor")
         .option("failOnDataLoss", "false")
         .load()
@@ -214,7 +255,7 @@ def main() -> None:
 
     query = (
         df.writeStream
-        .foreachBatch(_make_handler(pg_conn, redis_client))
+        .foreachBatch(_make_handler(pg_conn, redis_client, book_meters))
         .option("checkpointLocation", CHECKPOINT_DIR)
         .trigger(processingTime=f"{BATCH_INTERVAL} seconds")
         .start()

@@ -79,7 +79,7 @@
     {
       "id": 4, "type": "stat",
       "title": "Forecast — End of Window",
-      "description": "Projected kWh at the end of the current 30-min window: (kWh so far ÷ elapsed min) × 30.",
+      "description": "Projected kWh at end of the current 30-min window: kWh so far scaled up by the share of the book that has reported (kWh ÷ meter coverage).",
       "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
       "datasource": {"type": "redis-datasource", "uid": "redis"},
       "targets": [{
@@ -101,18 +101,19 @@
     {
       "id": 5, "type": "stat",
       "title": "Active Meters",
-      "description": "Distinct meters that reported at least one reading in the current window (HyperLogLog ±1%).",
+      "description": "Distinct meters that reported at least one reading in the current window (HyperLogLog ±1%). Book size ≈ 5,083 meters.",
       "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
       "datasource": {"type": "redis-datasource", "uid": "redis"},
       "targets": [{
-        "refId": "A", "command": "pfcount", "keyName": "window:meters_hll"
+        "refId": "A", "command": "get", "keyName": "window:meters"
       }],
       "fieldConfig": {
         "defaults": {
+          "noValue": "0",
           "thresholds": {"mode": "absolute", "steps": [
             {"color": "red",    "value": null},
-            {"color": "yellow", "value": 9000},
-            {"color": "green",  "value": 10200}
+            {"color": "yellow", "value": 4500},
+            {"color": "green",  "value": 4900}
           ]}
         }
       },
@@ -130,6 +131,7 @@
       }],
       "fieldConfig": {
         "defaults": {
+          "noValue": "0",
           "thresholds": {"mode": "absolute", "steps": [
             {"color": "green",  "value": null},
             {"color": "yellow", "value": 10},
@@ -151,6 +153,7 @@
       }],
       "fieldConfig": {
         "defaults": {
+          "noValue": "0",
           "thresholds": {"mode": "absolute", "steps": [
             {"color": "green",  "value": null},
             {"color": "yellow", "value": 20},
@@ -185,12 +188,12 @@
     {
       "id": 9, "type": "timeseries",
       "title": "Rejection Rate by Type — Last 24 h",
-      "description": "Rolling count of rejected readings per 30-min window, split by rejection reason. Spikes indicate vendor data quality issues.",
+      "description": "Hourly count of rejected readings, split by rejection reason, bucketed by reading_time (data-time). Spikes indicate vendor data quality issues.",
       "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
       "datasource": {"type": "postgres", "uid": "postgres"},
       "targets": [{
         "refId": "A",
-        "rawSql": "SELECT ts_hour AS time, rejection_reason AS metric, count AS value FROM rejection_hourly_summary WHERE $__timeFilter(ts_hour) ORDER BY 1",
+        "rawSql": "SELECT date_trunc('hour', reading_time) AS time, rejection_type AS metric, COUNT(*) AS value FROM rejected_readings WHERE reading_time IS NOT NULL AND $__timeFilter(reading_time) GROUP BY 1, 2 ORDER BY 1",
         "format": "time_series"
       }],
       "fieldConfig": {

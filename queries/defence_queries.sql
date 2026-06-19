@@ -137,23 +137,23 @@ SELECT
         2
     )                                                        AS off_peak_kwh,
     ROUND(
-        100.0
+        (100.0
         * SUM(CASE
               WHEN EXTRACT(HOUR FROM cr.reading_time AT TIME ZONE 'UTC') < 6
               THEN cr.kwh ELSE 0
           END)
-        / NULLIF(SUM(cr.kwh), 0),
+        / NULLIF(SUM(cr.kwh), 0))::numeric,   -- kwh is double precision; ROUND(.,2) needs numeric
         2
     )                                                        AS off_peak_pct,
     ROUND(
-        100.0
+        (100.0
         * SUM(CASE
               WHEN EXTRACT(HOUR FROM cr.reading_time AT TIME ZONE 'UTC') < 6
               THEN cr.kwh ELSE 0
           END)
         / NULLIF(SUM(cr.kwh), 0)
         -
-        100.0 * 6 / 24,    -- חלק שיש לצפות בו אם הצריכה שווה (25%)
+        100.0 * 6 / 24)::numeric,    -- חלק שיש לצפות בו אם הצריכה שווה (25%)
         2
     )                                                        AS shift_vs_uniform_pct
 FROM  clean_readings cr

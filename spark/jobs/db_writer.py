@@ -38,9 +38,36 @@ def _ts(value) -> Optional[datetime]:
 
 # ─── clean_readings ───────────────────────────────────────────────────────────
 
-_UPSERT_CLEAN = """
+# Bulk upsert via COPY into a temp table + a single set-based merge.  This is
+# orders of magnitude faster than row-by-row executemany at the volumes here
+# (hundreds of thousands of readings per micro-batch): COPY streams the rows in
+# one pass, and the INSERT…SELECT…ON CONFLICT applies them in one statement.
+_CREATE_STAGE = """
+CREATE TEMP TABLE IF NOT EXISTS _stage_clean (
+    meter_id     VARCHAR,
+    reading_time TIMESTAMPTZ,
+    household_id VARCHAR,
+    kwh          DOUBLE PRECISION,
+    received_at  TIMESTAMPTZ,
+    ingested_at  TIMESTAMPTZ
+) ON COMMIT DELETE ROWS
+"""
+
+_COPY_STAGE = (
+    "COPY _stage_clean "
+    "(meter_id, reading_time, household_id, kwh, received_at, ingested_at) FROM STDIN"
+)
+
+# DISTINCT ON keeps only the newest received_at per (meter_id, reading_time)
+# *within this batch* — so out-of-order or duplicate readings inside one batch
+# collapse to the correct latest value before they ever hit clean_readings.
+_MERGE_CLEAN = """
 INSERT INTO clean_readings (meter_id, reading_time, household_id, kwh, received_at, ingested_at)
-VALUES (%(meter_id)s, %(reading_time)s, %(household_id)s, %(kwh)s, %(received_at)s, %(now)s)
+SELECT DISTINCT ON (meter_id, reading_time)
+       meter_id, reading_time, household_id, kwh, received_at, ingested_at
+FROM   _stage_clean
+WHERE  meter_id IS NOT NULL AND reading_time IS NOT NULL
+ORDER  BY meter_id, reading_time, received_at DESC NULLS LAST
 ON CONFLICT (meter_id, reading_time) DO UPDATE
     SET kwh          = EXCLUDED.kwh,
         received_at  = EXCLUDED.received_at,
@@ -51,25 +78,30 @@ WHERE EXCLUDED.received_at > clean_readings.received_at
 
 
 def upsert_clean_readings(conn, readings: list[dict]) -> int:
-    """Upsert valid readings; returns number of rows attempted."""
+    """Upsert valid readings via COPY + merge; returns rows staged."""
     if not readings:
         return 0
     now = datetime.now(timezone.utc)
-    rows = [
-        {
-            "meter_id":     r.get("meter_id"),
-            "reading_time": _ts(r.get("reading_time")),
-            "household_id": r.get("household_id"),
-            "kwh":          float(r["kwh"]),
-            "received_at":  _ts(r.get("received_at")),
-            "now":          now,
-        }
-        for r in readings
-    ]
+    staged = 0
     with conn.cursor() as cur:
-        cur.executemany(_UPSERT_CLEAN, rows)
+        cur.execute(_CREATE_STAGE)
+        with cur.copy(_COPY_STAGE) as cp:
+            for r in readings:
+                rt = _ts(r.get("reading_time"))
+                if rt is None:
+                    continue
+                cp.write_row((
+                    r.get("meter_id"),
+                    rt,
+                    r.get("household_id"),
+                    float(r["kwh"]),
+                    _ts(r.get("received_at")),
+                    now,
+                ))
+                staged += 1
+        cur.execute(_MERGE_CLEAN)
     conn.commit()
-    return len(rows)
+    return staged
 
 
 # ─── rejected_readings ────────────────────────────────────────────────────────
