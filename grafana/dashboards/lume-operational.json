@@ -1,0 +1,216 @@
+{
+  "title": "Lume — Control Room",
+  "uid":   "lume-operational",
+  "description": "Real-time 30-min settlement window + feed health for on-call operators.",
+  "refresh": "5s",
+  "time": {"from": "2013-12-01T00:00:00.000Z", "to": "2014-03-01T00:00:00.000Z"},
+  "timezone": "utc",
+  "schemaVersion": 38,
+
+  "panels": [
+
+    {
+      "id": 1, "type": "stat",
+      "title": "Feed Status",
+      "description": "LIVE when vendor data arrived in last 150 s. DEAD when window:last_batch key expired.",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "ttl", "keyName": "window:last_batch"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "range", "options": {"from": 1,  "to": 150, "result": {"text": "LIVE",  "color": "green"}}},
+            {"type": "range", "options": {"from": -2, "to": 0,   "result": {"text": "DEAD",  "color": "red"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red",   "value": null},
+            {"color": "green", "value": 1}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "textMode": "name"}
+    },
+
+    {
+      "id": 2, "type": "stat",
+      "title": "Filling Gaps (Backfill)",
+      "description": "Banner appears when Spark is processing historical backfill payloads. kWh spikes during this time are expected.",
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "exists", "keyName": "window:backfill_active"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "—",              "color": "text"}}},
+            {"type": "value", "options": {"1": {"text": "FILLING GAPS",   "color": "yellow"}}}
+          ]
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "textMode": "name"}
+    },
+
+    {
+      "id": 3, "type": "gauge",
+      "title": "kWh — Current 30-min Window",
+      "description": "Running total for the current settlement window. Threshold at 90% of the target (10,800 kWh for 12,000 homes × 0.9 kWh avg).",
+      "gridPos": {"x": 8, "y": 0, "w": 8, "h": 8},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "get", "keyName": "window:kwh"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatth",
+          "min": 0, "max": 12000,
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green",  "value": null},
+            {"color": "yellow", "value": 9720},
+            {"color": "red",    "value": 10800}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+
+    {
+      "id": 4, "type": "stat",
+      "title": "Forecast — End of Window",
+      "description": "Projected kWh at the end of the current 30-min window: (kWh so far ÷ elapsed min) × 30.",
+      "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "get", "keyName": "window:forecast"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatth",
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green",  "value": null},
+            {"color": "yellow", "value": 9720},
+            {"color": "red",    "value": 10800}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none"}
+    },
+
+    {
+      "id": 5, "type": "stat",
+      "title": "Active Meters",
+      "description": "Distinct meters that reported at least one reading in the current window (HyperLogLog ±1%).",
+      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "pfcount", "keyName": "window:meters_hll"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red",    "value": null},
+            {"color": "yellow", "value": 9000},
+            {"color": "green",  "value": 10200}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none"}
+    },
+
+    {
+      "id": 6, "type": "stat",
+      "title": "Duplicates (5 min)",
+      "description": "Payloads skipped by Redis dedup in the last 5 minutes. >3% may indicate vendor chaos mode.",
+      "gridPos": {"x": 16, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "get", "keyName": "stats:dups:5m"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green",  "value": null},
+            {"color": "yellow", "value": 10},
+            {"color": "red",    "value": 50}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none"}
+    },
+
+    {
+      "id": 7, "type": "stat",
+      "title": "Invalid Readings (5 min)",
+      "description": "Readings rejected by validation (null kWh, out-of-range) in the last 5 minutes.",
+      "gridPos": {"x": 20, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "redis-datasource", "uid": "redis"},
+      "targets": [{
+        "refId": "A", "command": "get", "keyName": "stats:invalid:5m"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green",  "value": null},
+            {"color": "yellow", "value": 20},
+            {"color": "red",    "value": 100}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none"}
+    },
+
+    {
+      "id": 8, "type": "timeseries",
+      "title": "kWh per 30-min Settlement Window — Last 24 h",
+      "description": "Total kWh consumed by all 12,000 homes per window. Source: clean_readings (PostgreSQL).",
+      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 8},
+      "datasource": {"type": "postgres", "uid": "postgres"},
+      "targets": [{
+        "refId": "A",
+        "rawSql": "SELECT date_trunc('minute', reading_time) - (EXTRACT(MINUTE FROM reading_time)::int % 30) * INTERVAL '1 minute' AS time, SUM(kwh) AS total_kwh FROM clean_readings WHERE $__timeFilter(reading_time) GROUP BY 1 ORDER BY 1",
+        "format": "time_series"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatth",
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      },
+      "options": {"tooltip": {"mode": "single"}}
+    },
+
+    {
+      "id": 9, "type": "timeseries",
+      "title": "Rejection Rate by Type — Last 24 h",
+      "description": "Rolling count of rejected readings per 30-min window, split by rejection reason. Spikes indicate vendor data quality issues.",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "postgres", "uid": "postgres"},
+      "targets": [{
+        "refId": "A",
+        "rawSql": "SELECT ts_hour AS time, rejection_reason AS metric, count AS value FROM rejection_hourly_summary WHERE $__timeFilter(ts_hour) ORDER BY 1",
+        "format": "time_series"
+      }],
+      "fieldConfig": {
+        "defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 10}}
+      }
+    },
+
+    {
+      "id": 10, "type": "table",
+      "title": "Silent Meters — Last Detection",
+      "description": "Meters that have not reported in the last 2+ hours, as detected by the scheduler. Updated every 30 min.",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "postgres", "uid": "postgres"},
+      "targets": [{
+        "refId": "A",
+        "rawSql": "SELECT meter_id, postcode_area, last_seen, ROUND(silent_hours::numeric, 1) AS silent_hours, detected_at FROM meter_silence_log ORDER BY silent_hours DESC LIMIT 50",
+        "format": "table"
+      }],
+      "options": {"sortBy": [{"displayName": "silent_hours", "desc": true}]}
+    }
+
+  ]
+}

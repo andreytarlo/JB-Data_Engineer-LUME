@@ -1,0 +1,17 @@
+[project]
+name = "lume"
+version = "0.1.0"
+requires-python = ">=3.13"
+# Baseline dependencies. Add what you need as you go — the scaffold deliberately
+# does not pre-wire a stack. See BRIEF.md for the deliverables.
+dependencies = [
+    "kafka-python>=2.0,<3",
+    "pyspark>=3.5,<4",
+    "psycopg[binary]>=3.2,<4",
+    "redis>=5,<6",
+    "requests>=2.32,<3",
+    "pydantic>=2.7,<3",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "pytest>=8,<9",
+]

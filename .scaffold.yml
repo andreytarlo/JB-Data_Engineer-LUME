@@ -1,0 +1,20 @@
+name: lume
+title: (final project) Lume — energy retailer control room
+description: >
+  Capstone A. A small UK challenger energy retailer ("Lume") needs an operational
+  control room and an analytical SQL surface for its overnight grid-balancing
+  shift. The scaffold ships only the upstream: a vendor meter mock that streams
+  smart-meter readings via webhook + a paginated REST archive, fed from the
+  London Datastore LCL dataset (downloaded and preprocessed by a data-init
+  sidecar on first `make run`). Students design the rest — ingest, storage,
+  alerting, dashboards — and defend their system live with SQL queries.
+exclude:
+  - "**/__pycache__/"
+  - "data/"
+  - "*.egg-info/"
+  - ".pytest_cache/"
+post_init: .post-init.py
+next_steps:
+  - "cd {target}"
+  - "make run                # build vendor image, download LCL data, start meter-vendor"
+  - "open BRIEF.md           # read the project brief"

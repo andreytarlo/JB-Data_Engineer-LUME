@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Local config
+.env
+
+# Scratch data (the vendor's downloaded parquet lives in a docker volume,
+# not here — but students may stash exploratory CSVs/parquet under data/).
+data/*
+!data/.gitkeep

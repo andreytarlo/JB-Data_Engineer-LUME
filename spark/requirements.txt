@@ -1,0 +1,4 @@
+# Python dependencies for the Spark streaming job.
+# Installed via Dockerfile — this file is for reference / local dev.
+psycopg[binary]>=3.1
+redis>=5.0

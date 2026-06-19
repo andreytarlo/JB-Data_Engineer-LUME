@@ -1,0 +1,296 @@
+# Lume capstone — self-contained compose (does NOT merge labs/base/compose.yml).
+#
+# Ships only the upstream vendor mock:
+#   data-init    one-shot: downloads + preprocesses the LCL dataset into the
+#                meter-data volume. Idempotent (skips if _READY is present).
+#   meter-vendor FastAPI service that reads from that volume. Serves
+#                GET /readings (paginated archive) and pushes POST webhooks
+#                via the replay loop.
+#
+# Students add their own services (Kafka, Postgres, monitoring, etc.) below.
+# Container names and host ports are prefixed/shifted so this can coexist with
+# the main course `labs/` (which use the default ports).
+
+name: lume
+
+volumes:
+  meter-data:
+  kafka-data:
+  backfill-state:
+  pg-data:
+  redis-data:
+  spark-checkpoint:
+  grafana-data:
+
+services:
+  data-init:
+    build: ./vendor
+    container_name: lume-data-init
+    command: ["python", "/app/download_and_preprocess.py", "/data"]
+    volumes:
+      - meter-data:/data
+    # Needs REPLAY_WINDOW_START/END (and optionally PREPROCESS_BACKFILL_DAYS,
+    # LCL_ZIP_PATH for fast iteration) so it knows what slice to keep.
+    env_file:
+      - .env
+    restart: "no"
+
+  meter-vendor:
+    build: ./vendor
+    container_name: lume-meter-vendor
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    volumes:
+      - meter-data:/data
+    ports:
+      - "18100:8000"
+    # We don't use env_file here on purpose: env_file values always win over
+    # shell-exported vars, which would defeat `make vendor-chaos` (it exports
+    # the chaos knobs at the shell). Instead use compose variable substitution
+    # — values resolve from shell first, then from .env (compose loads it
+    # automatically), then from the inline default.
+    environment:
+      DATA_DIR: /data
+      REPLAY_SECONDS_PER_DAY: ${REPLAY_SECONDS_PER_DAY:-3}
+      REPLAY_WINDOW_START: ${REPLAY_WINDOW_START:-2013-12-01}
+      REPLAY_WINDOW_END: ${REPLAY_WINDOW_END:-2014-02-28}
+      REPLAY_LOOP: ${REPLAY_LOOP:-true}
+      VENDOR_DUPLICATE_RATE: ${VENDOR_DUPLICATE_RATE:-0.0}
+      VENDOR_REORDER_RATE: ${VENDOR_REORDER_RATE:-0.0}
+      VENDOR_LATE_RATE: ${VENDOR_LATE_RATE:-0.0}
+      VENDOR_OUTAGE_SCHEDULE: ${VENDOR_OUTAGE_SCHEDULE:-}
+    # host.docker.internal works out of the box on Docker Desktop (mac/windows).
+    # The extra_hosts mapping below makes it resolve on Linux too, so student
+    # webhook receivers running on the host are reachable from the container.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ─── Layer 2: Message queue ────────────────────────────────────────────────
+
+  kafka:
+    image: bitnamilegacy/kafka:3.7
+    container_name: lume-kafka
+    environment:
+      # KRaft mode — no Zookeeper required.
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Keep messages for 1 h — 24 h accumulates ~970 GB in simulation.
+      KAFKA_CFG_LOG_RETENTION_HOURS: 1
+      # Topics are created explicitly by kafka-init below.
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    ports:
+      - "19092:9092"   # exposed for local debugging / kafka-topics.sh on host
+    healthcheck:
+      # Run inside the container — localhost:9092, not kafka:9092 (that would
+      # route through Docker DNS and could fail before the listener is ready).
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  kafka-init:
+    # One-shot: creates the readings-raw topic (2 partitions: 0=live, 1=backfill).
+    image: bitnamilegacy/kafka:3.7
+    container_name: lume-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      kafka-topics.sh --bootstrap-server kafka:9092
+        --create --if-not-exists
+        --topic readings-raw
+        --partitions 2
+        --replication-factor 1
+        --config retention.ms=3600000
+    restart: "no"
+
+  # ─── Layer 1: Ingest gateway ───────────────────────────────────────────────
+
+  ingest-gateway:
+    build: ./ingest
+    container_name: lume-ingest-gateway
+    ports:
+      - "18080:8080"
+    environment:
+      VENDOR_URL: http://meter-vendor:8000
+      INGEST_WEBHOOK_URL: http://ingest-gateway:8080/ingest
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      meter-vendor:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ─── Layer 5: Storage ──────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lume-postgres
+    environment:
+      POSTGRES_DB:       lume
+      POSTGRES_USER:     lume
+      POSTGRES_PASSWORD: lume
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # SQL files in this directory run automatically on first start.
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lume", "-d", "lume"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ─── Layer 6: Real-time state ───────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    container_name: lume-redis
+    # appendonly: persist state to disk so a restart doesn't clear window:* keys.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ─── Dimension loader (one-shot) ────────────────────────────────────────────
+
+  load-dimensions:
+    build: ./db
+    container_name: lume-load-dimensions
+    environment:
+      DATA_DIR:     /data
+      POSTGRES_DSN: postgresql://lume:lume@postgres:5432/lume
+    volumes:
+      - meter-data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # ─── Layer 4: Spark Structured Streaming ───────────────────────────────────
+
+  spark:
+    build: ./spark
+    container_name: lume-spark
+    command: >
+      /opt/bitnami/spark/bin/spark-submit
+      --master local[2]
+      /app/jobs/process.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_DSN:            postgresql://lume:lume@postgres:5432/lume
+      REDIS_HOST:              redis
+      REDIS_PORT:              "6379"
+      CHECKPOINT_DIR:          /checkpoint
+      BATCH_INTERVAL_S:        "5"
+      PYTHONPATH:              /app/jobs
+    volumes:
+      - spark-checkpoint:/checkpoint
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      load-dimensions:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ─── Scheduler — periodic maintenance ─────────────────────────────────────
+
+  scheduler:
+    build: ./scheduler
+    container_name: lume-scheduler
+    environment:
+      POSTGRES_DSN:        postgresql://lume:lume@postgres:5432/lume
+      SILENCE_THRESHOLD_H: "2"
+      REJECTED_RETAIN_D:   "7"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      load-dimensions:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ─── Layer 7: Dashboards ────────────────────────────────────────────────────
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: lume-grafana
+    environment:
+      GF_INSTALL_PLUGINS:          redis-datasource
+      GF_SECURITY_ADMIN_PASSWORD:  lume
+      GF_AUTH_ANONYMOUS_ENABLED:   "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE:  Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "13000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Layer 2 producer — Historical Archive Backfill.
+  # Reads from the vendor's paginated GET /readings archive and pushes
+  # pages to Kafka partition 1 (the backfill lane).
+  # Two jobs: (1) initial full historical load on first start,
+  # (2) automatic gap-fill after any live-feed outage.
+  backfill:
+    build: ./backfill
+    container_name: lume-backfill
+    environment:
+      VENDOR_URL: http://meter-vendor:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REPLAY_WINDOW_START: ${REPLAY_WINDOW_START:-2013-12-01}
+      STATE_DIR: /state
+      BACKFILL_PAGE_LIMIT: 1000
+      BACKFILL_IDLE_SLEEP_S: 30
+    volumes:
+      - backfill-state:/state
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      meter-vendor:
+        condition: service_healthy
+    restart: unless-stopped
