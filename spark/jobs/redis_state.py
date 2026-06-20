@@ -40,7 +40,7 @@ from typing import Optional
 log = logging.getLogger("redis_state")
 
 WINDOW_MINUTES        = 30
-LAST_BATCH_TTL_S      = 600   # "feed dead" fires after 10 minutes of silence
+LAST_BATCH_TTL_S      = 150   # "feed dead" fires after 150 s of silence (~30 batches)
 STATS_TTL_S           = 5 * 60
 BACKFILL_ACTIVE_TTL_S = 60    # banner stays up 60 s after last backfill batch
 
