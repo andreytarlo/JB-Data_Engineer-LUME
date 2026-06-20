@@ -12,7 +12,7 @@
 # to design. Add services to compose.yml as you need them.
 # ────────────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop reset logs logs-ingest logs-backfill vendor-chaos vendor-calm help
+.PHONY: run stop reset logs logs-ingest logs-backfill vendor-chaos vendor-calm demo help
 
 help:
 	@echo ""
@@ -24,6 +24,7 @@ help:
 	@echo "  make logs-backfill  Tail backfill service logs"
 	@echo "  make vendor-chaos   Restart meter-vendor with duplicates/reordering/outages on"
 	@echo "  make vendor-calm    Restart meter-vendor with chaos all-zero"
+	@echo "  make demo           Inject demo readings + verify Grafana dashboard is live"
 	@echo ""
 	@echo "  Vendor API:      http://localhost:18100/docs"
 	@echo "  Vendor health:   http://localhost:18100/healthz"
@@ -73,3 +74,19 @@ vendor-calm:
 	VENDOR_OUTAGE_SCHEDULE= \
 	docker compose up -d --no-deps --force-recreate meter-vendor
 	@echo "[calm] meter-vendor restarted with chaos disabled."
+
+# Dedicated demo check: inject invalid + duplicate readings through the REAL
+# pipeline (ingest -> Kafka -> Spark -> Postgres + Redis), then confirm Grafana
+# is healthy and the Control Room dashboard is loaded. Use it to show, on demand,
+# that the rejection/duplicate panels light up without waiting for vendor chaos.
+demo:
+	@echo "[demo] injecting demo readings through the real pipeline (every 10s for 30s)..."
+	python tools/inject_demo.py --loop 10 --duration 30
+	@echo ""
+	@echo "[demo] verifying Grafana..."
+	@curl -s -o /dev/null -w "  Grafana health HTTP: %{http_code}\n" http://localhost:13000/api/health
+	@curl -s -u admin:lume http://localhost:13000/api/dashboards/uid/lume-operational | \
+		python -c "import sys,json; d=json.load(sys.stdin); print('  Control Room panels loaded:', len(d['dashboard']['panels']))"
+	@echo ""
+	@echo "  ==> Open http://localhost:13000  (folder: Lume -> Control Room)"
+	@echo "      Watch 'Invalid Readings (5 min)' and 'Duplicates (5 min)' tick up."

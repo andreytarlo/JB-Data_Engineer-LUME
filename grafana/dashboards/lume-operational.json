@@ -165,6 +165,49 @@
     },
 
     {
+      "id": 11, "type": "stat",
+      "title": "Last Delivery Accepted",
+      "description": "Wall-clock time the most recent delivery was accepted into batch_log (live + backfill). Answers BRIEF feed-health: 'when was the last delivery accepted?'. NOT filtered by the dashboard's 2013-14 data-time range — logged_at is real receipt time.",
+      "gridPos": {"x": 0, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "postgres"},
+      "targets": [{
+        "refId": "A",
+        "rawSql": "SELECT MAX(logged_at) AS \"Last delivery\" FROM batch_log",
+        "format": "table"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no deliveries yet",
+          "custom": {}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "none", "textMode": "value", "graphMode": "none"}
+    },
+
+    {
+      "id": 12, "type": "stat",
+      "title": "Deliveries — 5 min vs Baseline",
+      "description": "Left: deliveries accepted in the last 5 minutes. Right: the trailing hour's average per 5-min bucket (hour count / 12). A last-5-min value well below baseline means the feed is slowing. Answers BRIEF feed-health: 'how many deliveries in the last 5 minutes vs the trailing hour's baseline?'.",
+      "gridPos": {"x": 4, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "postgres", "uid": "postgres"},
+      "targets": [{
+        "refId": "A",
+        "rawSql": "SELECT COUNT(*) FILTER (WHERE logged_at > NOW() - INTERVAL '5 minutes') AS \"Last 5 min\", ROUND(COUNT(*) FILTER (WHERE logged_at > NOW() - INTERVAL '1 hour')::numeric / 12.0, 1) AS \"Baseline /5 min\" FROM batch_log",
+        "format": "table"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "0",
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "text", "value": null}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "none", "textMode": "value_and_name", "graphMode": "none", "orientation": "horizontal"}
+    },
+
+    {
       "id": 8, "type": "timeseries",
       "title": "kWh per 30-min Settlement Window — Last 24 h",
       "description": "Total kWh consumed by all 12,000 homes per window. Source: clean_readings (PostgreSQL).",

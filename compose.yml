@@ -88,8 +88,15 @@ services:
       KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      # Keep messages for 1 h — 24 h accumulates ~970 GB in simulation.
-      KAFKA_CFG_LOG_RETENTION_HOURS: 1
+      # Keep messages for 6 h. Retention must exceed the worst-case processor
+      # downtime: live-only data (late corrections via the webhook) is NOT in
+      # the historical archive, so if Spark is down longer than retention those
+      # messages age out of Kafka and the backfill cannot recover them. Spark
+      # restarts in seconds (restart: unless-stopped), so 6 h is a wide margin.
+      # Disk scales with replay rate: ~12 GB at the recommended moderate replay
+      # (60 s/day); at the 3 s/day stress rate it is far larger — another reason
+      # stress rate is not the operational mode (see PROJECT_REPORT §8).
+      KAFKA_CFG_LOG_RETENTION_HOURS: 6
       # Topics are created explicitly by kafka-init below.
       KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
     volumes:
@@ -119,7 +126,7 @@ services:
         --topic readings-raw
         --partitions 2
         --replication-factor 1
-        --config retention.ms=3600000
+        --config retention.ms=21600000
     restart: "no"
 
   # ─── Layer 1: Ingest gateway ───────────────────────────────────────────────
