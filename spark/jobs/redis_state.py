@@ -143,7 +143,18 @@ def _apply_to_window(
     else:
         stored_dt = None
 
-    if stored_dt is None or _window_start(stored_dt) != cur_window:
+    stored_window = _window_start(stored_dt) if stored_dt is not None else None
+
+    # Roll the window FORWARD only. A pure-backfill batch can carry an older
+    # max(reading_time) than the live window (heavy history push with no live
+    # readings in the same trigger); rolling the window back to that old time
+    # would corrupt the live kWh total on the dashboard (the DB stays correct).
+    # So if this batch's window is older than what we already track, skip it.
+    if stored_window is not None and cur_window < stored_window:
+        log.debug("Skipping old window %s (stored %s) — backfill, no rollback",
+                  cur_window.isoformat(), stored_window.isoformat())
+        return
+    if stored_window is None or cur_window > stored_window:
         _rollover(r, cur_window)
 
     # Accumulate kWh and register meters.

@@ -73,7 +73,17 @@ ON CONFLICT (meter_id, reading_time) DO UPDATE
         received_at  = EXCLUDED.received_at,
         household_id = EXCLUDED.household_id,
         ingested_at  = EXCLUDED.ingested_at
+-- A strictly newer received_at always wins. But the vendor does NOT guarantee a
+-- late correction carries a later received_at — it may re-emit the same
+-- (meter_id, reading_time) with the SAME received_at and a corrected kwh. With a
+-- plain ">" that correction would be silently dropped (breaking "late
+-- corrections must overwrite"). So we also overwrite when received_at is equal
+-- (NULL-safe) AND this ingest is newer AND the value actually changed — the
+-- kwh-distinct guard keeps a true duplicate (identical value) a no-op.
 WHERE EXCLUDED.received_at > clean_readings.received_at
+   OR (EXCLUDED.received_at IS NOT DISTINCT FROM clean_readings.received_at
+       AND EXCLUDED.ingested_at > clean_readings.ingested_at
+       AND EXCLUDED.kwh IS DISTINCT FROM clean_readings.kwh)
 """
 
 
@@ -172,7 +182,10 @@ INSERT INTO meter_lag_stats (meter_id, avg_lag_sec, p95_lag_sec, max_lag_sec, up
 VALUES (%(meter_id)s, %(avg_lag)s, %(p95_lag)s, %(max_lag)s, %(now)s)
 ON CONFLICT (meter_id) DO UPDATE
     SET avg_lag_sec = meter_lag_stats.avg_lag_sec * 0.8 + EXCLUDED.avg_lag_sec * 0.2,
-        p95_lag_sec = GREATEST(meter_lag_stats.p95_lag_sec, EXCLUDED.p95_lag_sec),
+        -- Exponentially smoothed like avg_lag_sec, so it tracks a true rolling
+        -- p95 that can fall as the feed recovers — not a monotonic all-time max.
+        p95_lag_sec = meter_lag_stats.p95_lag_sec * 0.8 + EXCLUDED.p95_lag_sec * 0.2,
+        -- max stays an all-time high water mark (GREATEST is correct here).
         max_lag_sec = GREATEST(meter_lag_stats.max_lag_sec, EXCLUDED.max_lag_sec),
         updated_at  = EXCLUDED.updated_at
 """

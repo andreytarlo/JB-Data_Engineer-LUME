@@ -68,6 +68,12 @@ def _connect_pg() -> psycopg.Connection:
             # instead of spilling to disk on large catch-up batches.
             with conn.cursor() as cur:
                 cur.execute("SET work_mem = '256MB'")
+                # Drop the per-commit fsync on this writer's sessions only (NOT
+                # analyst queries). Safe here: Kafka is the durable log and the
+                # conditional upsert is idempotent, so a crash that loses the
+                # last few ms of WAL is recovered by reprocessing the batch.
+                # Removes the fsync bottleneck on the high-volume write path.
+                cur.execute("SET synchronous_commit = off")
             conn.commit()
             log.info("PostgreSQL connected")
             return conn

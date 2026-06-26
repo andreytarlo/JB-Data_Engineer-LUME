@@ -43,6 +43,40 @@ _subscription_id: str | None = None
 _registration_failed: bool = False
 
 
+async def _cleanup_own_subscriptions(client: httpx.AsyncClient) -> int:
+    """Delete any pre-existing vendor subscriptions that already point back at
+    this gateway, before registering a fresh one.
+
+    The vendor persists subscriptions to disk and restores them on restart, so
+    without this every restart of the vendor (e.g. `make vendor-chaos`) or of
+    this gateway would leave another live subscription pointing here. The vendor
+    would then fan out every half-hour slice to us once per subscription —
+    multiplying the live load N× and pushing the Spark writer behind for no
+    reason. Removing our own URL first makes (re)subscription idempotent: the
+    vendor ends up with exactly one subscription for this gateway.
+    """
+    try:
+        r = await client.get(f"{VENDOR_URL}/stats", timeout=10.0)
+        r.raise_for_status()
+        subs = r.json().get("subscribers", {})
+    except Exception as exc:
+        log.warning("Could not list subscriptions for cleanup (%s) — skipping", exc)
+        return 0
+
+    removed = 0
+    for sid, info in subs.items():
+        if info.get("webhook_url") == INGEST_WEBHOOK_URL:
+            try:
+                await client.delete(f"{VENDOR_URL}/subscriptions/{sid}", timeout=10.0)
+                removed += 1
+                log.info("Removed stale subscription %s pointing at this gateway", sid)
+            except Exception as exc:
+                log.warning("Could not remove stale subscription %s: %s", sid, exc)
+    if removed:
+        log.info("Cleaned up %d stale subscription(s) before subscribing", removed)
+    return removed
+
+
 async def _subscribe_with_retry(client: httpx.AsyncClient, attempts: int = 10) -> str | None:
     """Register this gateway as a webhook subscriber; retry on transient failures."""
     for i in range(attempts):
@@ -86,6 +120,10 @@ async def lifespan(_app: FastAPI):
 
     # Register with the meter vendor so it starts pushing batches here.
     async with httpx.AsyncClient() as client:
+        # Idempotent: drop any prior subscriptions for this gateway first, so a
+        # vendor/gateway restart never leaves us subscribed N× (which would fan
+        # out every slice N times and overload the writer).
+        await _cleanup_own_subscriptions(client)
         _subscription_id = await _subscribe_with_retry(client)
 
     # FIX 3: if all registration attempts failed the vendor will never push

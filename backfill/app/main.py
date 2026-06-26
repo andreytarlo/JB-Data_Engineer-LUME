@@ -136,10 +136,12 @@ def run_pass(producer: KafkaProducer) -> int:
             # Archive is exhausted up to simulated-now.
             break
 
-        # The vendor sets the same delivery_id on every reading in a page
-        # (see vendor/app/main.py).  Extract it as the batch-level id so
-        # Layer 3 can dedup whole pages efficiently.
-        delivery_id = readings[0].get("delivery_id") or _content_hash(readings)
+        # The archive assigns a fresh random delivery_id (arch_<uuid>) on every
+        # fetch, so reusing it would give the same page a different id each time
+        # and defeat Layer 3 dedup on re-fetch after a crash.  Always derive the
+        # id from the page content instead: a re-fetched page maps to the same
+        # id, so Redis skips it instead of reprocessing it.
+        delivery_id = _content_hash(readings)
         ingest_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         payload = {

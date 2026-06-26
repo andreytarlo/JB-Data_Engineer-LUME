@@ -78,7 +78,7 @@ SELECT
     last_seen,
     EXTRACT(EPOCH FROM ((SELECT now_ts FROM data_now) - last_seen)) / 3600.0 AS silent_hours
 FROM last_reading
-WHERE last_seen < (SELECT now_ts FROM data_now) - INTERVAL '%s hours'
+WHERE last_seen < (SELECT now_ts FROM data_now) - (%s * INTERVAL '1 hour')
 ORDER BY silent_hours DESC
 """
 
@@ -92,7 +92,7 @@ def check_meter_silence(conn: psycopg.Connection) -> None:
     log.info("Task: check_meter_silence (threshold=%dh)", SILENCE_THRESHOLD_H)
     try:
         with conn.cursor() as cur:
-            cur.execute(_SILENCE_QUERY % SILENCE_THRESHOLD_H)
+            cur.execute(_SILENCE_QUERY, (SILENCE_THRESHOLD_H,))
             rows = cur.fetchall()
 
         if not rows:
@@ -182,22 +182,40 @@ def refresh_orphan_summary(conn: psycopg.Connection) -> None:
 # make the permanent trend table disagree with every reading_time-based query and
 # dashboard.  The retention filter below still uses rejected_at — that is real
 # insert age, which is the right basis for purging.
+# Cumulative summation, not GREATEST. Rows live in rejected_readings for the
+# retention window (7 days) and stay eligible across several daily runs, so a
+# plain re-aggregate would either double-count (sum) or under-count (GREATEST).
+# We mark each row archived=TRUE the moment it is folded in, and only aggregate
+# NOT-archived rows — so every reject is counted exactly once and the hourly
+# totals are a true cumulative sum. All in one statement (atomic).
 _ARCHIVE_REJECTED = """
-INSERT INTO rejection_hourly_summary (ts_hour, rejection_reason, count)
-SELECT
-    date_trunc('hour', COALESCE(reading_time, rejected_at)) AS ts_hour,
-    rejection_type                                          AS rejection_reason,
-    COUNT(*)                                                AS count
-FROM  rejected_readings
-WHERE rejected_at < NOW() - INTERVAL '1 day'
-GROUP BY 1, 2
-ON CONFLICT (ts_hour, rejection_reason) DO UPDATE
-    SET count = GREATEST(rejection_hourly_summary.count, EXCLUDED.count)
+WITH to_archive AS (
+    SELECT id,
+           date_trunc('hour', COALESCE(reading_time, rejected_at)) AS ts_hour,
+           rejection_type                                          AS rejection_reason
+    FROM   rejected_readings
+    WHERE  rejected_at < NOW() - INTERVAL '1 day'
+      AND  NOT archived
+),
+agg AS (
+    SELECT ts_hour, rejection_reason, COUNT(*) AS count
+    FROM   to_archive
+    GROUP  BY ts_hour, rejection_reason
+),
+ins AS (
+    INSERT INTO rejection_hourly_summary (ts_hour, rejection_reason, count)
+    SELECT ts_hour, rejection_reason, count FROM agg
+    ON CONFLICT (ts_hour, rejection_reason) DO UPDATE
+        SET count = rejection_hourly_summary.count + EXCLUDED.count
+)
+UPDATE rejected_readings
+   SET archived = TRUE
+ WHERE id IN (SELECT id FROM to_archive)
 """
 
 _PURGE_REJECTED = """
 DELETE FROM rejected_readings
-WHERE rejected_at < NOW() - INTERVAL '%s days'
+WHERE rejected_at < NOW() - (%s * INTERVAL '1 day')
 """
 
 
@@ -208,10 +226,10 @@ def archive_and_purge_rejected(conn: psycopg.Connection) -> None:
             cur.execute(_ARCHIVE_REJECTED)
             archived = cur.rowcount
         conn.commit()
-        log.info("archive_and_purge_rejected: archived %d hour-buckets", archived)
+        log.info("archive_and_purge_rejected: folded %d rejected rows into hourly summary", archived)
 
         with conn.cursor() as cur:
-            cur.execute(_PURGE_REJECTED % REJECTED_RETAIN_D)
+            cur.execute(_PURGE_REJECTED, (REJECTED_RETAIN_D,))
             purged = cur.rowcount
         conn.commit()
         log.info("archive_and_purge_rejected: purged %d rows older than %dd",

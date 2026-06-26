@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS weather_hourly (
 
 -- ─── Core readings table ─────────────────────────────────────────────────────
 
+-- Range-partitioned by reading_time (monthly). Each write touches only the
+-- current partition's small B-tree instead of one ever-growing index over
+-- 13M+ rows, which is the single biggest write bottleneck at high replay rates.
+-- reading_time is part of the PK, as required for a partition key. INSERT routes
+-- rows to the right partition automatically; ON CONFLICT (meter_id,
+-- reading_time) still works because the conflict target is the PK.
 CREATE TABLE IF NOT EXISTS clean_readings (
     meter_id     VARCHAR          NOT NULL,
     reading_time TIMESTAMPTZ      NOT NULL,
@@ -33,9 +39,28 @@ CREATE TABLE IF NOT EXISTS clean_readings (
     received_at  TIMESTAMPTZ,
     ingested_at  TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     PRIMARY KEY (meter_id, reading_time)
-);
+) PARTITION BY RANGE (reading_time);
+
+-- Monthly partitions covering the replay window (preprocess keeps
+-- [REPLAY_WINDOW_START - 30 days, END]; default window ≈ 2013-11 .. 2014-02).
+CREATE TABLE IF NOT EXISTS clean_readings_2013_10 PARTITION OF clean_readings
+    FOR VALUES FROM ('2013-10-01+00') TO ('2013-11-01+00');
+CREATE TABLE IF NOT EXISTS clean_readings_2013_11 PARTITION OF clean_readings
+    FOR VALUES FROM ('2013-11-01+00') TO ('2013-12-01+00');
+CREATE TABLE IF NOT EXISTS clean_readings_2013_12 PARTITION OF clean_readings
+    FOR VALUES FROM ('2013-12-01+00') TO ('2014-01-01+00');
+CREATE TABLE IF NOT EXISTS clean_readings_2014_01 PARTITION OF clean_readings
+    FOR VALUES FROM ('2014-01-01+00') TO ('2014-02-01+00');
+CREATE TABLE IF NOT EXISTS clean_readings_2014_02 PARTITION OF clean_readings
+    FOR VALUES FROM ('2014-02-01+00') TO ('2014-03-01+00');
+CREATE TABLE IF NOT EXISTS clean_readings_2014_03 PARTITION OF clean_readings
+    FOR VALUES FROM ('2014-03-01+00') TO ('2014-04-01+00');
+-- Safety net: anything outside the pre-created ranges (e.g. injected demo
+-- readings stamped at wall-clock) still lands somewhere instead of erroring.
+CREATE TABLE IF NOT EXISTS clean_readings_default PARTITION OF clean_readings DEFAULT;
 
 -- Range queries on reading_time dominate all 6 defence queries.
+-- On a partitioned parent this creates a matching local index on every partition.
 CREATE INDEX IF NOT EXISTS cr_reading_time_idx ON clean_readings (reading_time);
 
 -- ─── Correction tracking trigger ─────────────────────────────────────────────
@@ -80,11 +105,16 @@ CREATE TABLE IF NOT EXISTS rejected_readings (
     rejection_type   VARCHAR          NOT NULL,
     rejection_detail VARCHAR,
     source           VARCHAR,
-    rejected_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+    rejected_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    -- Set TRUE once the daily archive job has folded this row into
+    -- rejection_hourly_summary, so cumulative summation counts it exactly once.
+    archived         BOOLEAN          NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS rr_received_at_idx  ON rejected_readings (received_at);
 CREATE INDEX IF NOT EXISTS rr_meter_type_idx   ON rejected_readings (meter_id, rejection_type);
+-- Partial index: the archive job only ever scans rows not yet archived.
+CREATE INDEX IF NOT EXISTS rr_unarchived_idx   ON rejected_readings (rejected_at) WHERE NOT archived;
 
 -- ─── Operational tables ──────────────────────────────────────────────────────
 
