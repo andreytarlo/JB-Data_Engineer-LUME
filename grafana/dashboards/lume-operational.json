@@ -178,10 +178,11 @@
       "fieldConfig": {
         "defaults": {
           "noValue": "no deliveries yet",
+          "unit": "dateTimeFromNow",
           "custom": {}
         }
       },
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "none", "textMode": "value", "graphMode": "none"}
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "/.*/"}, "colorMode": "none", "textMode": "value", "graphMode": "none"}
     },
 
     {
