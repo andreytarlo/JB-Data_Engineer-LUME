@@ -3,7 +3,7 @@
   "uid":   "lume-operational",
   "description": "Real-time 30-min settlement window + feed health for on-call operators.",
   "refresh": "5s",
-  "time": {"from": "2013-12-01T00:00:00.000Z", "to": "2014-03-01T00:00:00.000Z"},
+  "time": {"from": "2014-02-26T00:00:00.000Z", "to": "2014-02-28T00:00:00.000Z"},
   "timezone": "utc",
   "schemaVersion": 38,
 
@@ -216,7 +216,7 @@
       "datasource": {"type": "postgres", "uid": "postgres"},
       "targets": [{
         "refId": "A",
-        "rawSql": "SELECT date_trunc('minute', reading_time) - (EXTRACT(MINUTE FROM reading_time)::int % 30) * INTERVAL '1 minute' AS time, SUM(kwh) AS total_kwh FROM clean_readings WHERE $__timeFilter(reading_time) GROUP BY 1 ORDER BY 1",
+        "rawSql": "SELECT date_trunc('minute', reading_time) - (EXTRACT(MINUTE FROM reading_time)::int % 30) * INTERVAL '1 minute' AS time, SUM(kwh) AS total_kwh FROM clean_readings WHERE reading_time > (SELECT MAX(reading_time) FROM clean_readings) - INTERVAL '24 hours' GROUP BY 1 ORDER BY 1",
         "format": "time_series"
       }],
       "fieldConfig": {
