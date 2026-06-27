@@ -56,7 +56,7 @@
     {
       "id": 3, "type": "gauge",
       "title": "kWh — Current 30-min Window",
-      "description": "Running total for the current settlement window. Threshold at 90% of the target (10,800 kWh for 12,000 homes × 0.9 kWh avg).",
+      "description": "Running total for the current settlement window. Threshold at 90% of the target (4,575 kWh for 5,083 homes × 0.9 kWh avg).",
       "gridPos": {"x": 8, "y": 0, "w": 8, "h": 8},
       "datasource": {"type": "redis-datasource", "uid": "redis"},
       "targets": [{
@@ -65,11 +65,11 @@
       "fieldConfig": {
         "defaults": {
           "unit": "kwatth",
-          "min": 0, "max": 12000,
+          "min": 0, "max": 5083,
           "thresholds": {"mode": "absolute", "steps": [
             {"color": "green",  "value": null},
-            {"color": "yellow", "value": 9720},
-            {"color": "red",    "value": 10800}
+            {"color": "yellow", "value": 4118},
+            {"color": "red",    "value": 4575}
           ]}
         }
       },
@@ -211,7 +211,7 @@
     {
       "id": 8, "type": "timeseries",
       "title": "kWh per 30-min Settlement Window — Last 24 h",
-      "description": "Total kWh consumed by all 12,000 homes per window. Source: clean_readings (PostgreSQL).",
+      "description": "Total kWh consumed by all 5,083 homes per window. Source: clean_readings (PostgreSQL).",
       "gridPos": {"x": 0, "y": 8, "w": 24, "h": 8},
       "datasource": {"type": "postgres", "uid": "postgres"},
       "targets": [{
